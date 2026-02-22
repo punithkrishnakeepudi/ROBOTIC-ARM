@@ -1,0 +1,203 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
+#include <Servo.h>
+
+// ================= CONFIG =================
+#define NUM_SERVOS 6
+#define UDP_PORT 4210
+
+const char* ssid = "RobotArm_AP";
+const char* password = "12345678";
+
+// ================= OBJECTS =================
+ESP8266WebServer server(80);
+WiFiUDP udp;
+Servo servos[NUM_SERVOS];
+
+// ================= SERVO PINS =================
+int servoPins[NUM_SERVOS] = {D0, D1, D2, D3, D4, D5};
+
+// ================= SERVO STATE =================
+int currentAngle[NUM_SERVOS] = {90, 90, 90, 90, 90, 90};
+int targetAngle[NUM_SERVOS]  = {90, 90, 90, 90, 90, 90};
+
+char packetBuffer[50];
+
+// =====================================================
+// SMOOTH SERVO MOVEMENT
+// =====================================================
+void updateServosSmooth() {
+  for (int i = 0; i < NUM_SERVOS; i++) {
+
+    // Gripper (instant movement)
+    if (i == 5) {
+      currentAngle[i] = targetAngle[i];
+      servos[i].write(currentAngle[i]);
+      continue;
+    }
+
+    int step = 4;  // adjust speed here
+
+    if (currentAngle[i] < targetAngle[i])
+      currentAngle[i] = min(currentAngle[i] + step, targetAngle[i]);
+    else if (currentAngle[i] > targetAngle[i])
+      currentAngle[i] = max(currentAngle[i] - step, targetAngle[i]);
+
+    servos[i].write(currentAngle[i]);
+  }
+}
+
+// =====================================================
+// BROADCAST TO WEBOTS
+// =====================================================
+void broadcastServo(int id, int angle) {
+  String outMsg = "S" + String(id) + ":" + String(angle);
+
+  udp.beginPacket("192.168.4.255", UDP_PORT);  // Broadcast
+  udp.print(outMsg);
+  udp.endPacket();
+}
+
+// =====================================================
+// SET TARGET SERVO
+// =====================================================
+void setServo(int id, int angle) {
+  if (id >= 0 && id < NUM_SERVOS) {
+
+    angle = constrain(angle, 0, 180);
+    targetAngle[id] = angle;
+
+    Serial.print("Servo ");
+    Serial.print(id);
+    Serial.print(" -> ");
+    Serial.println(angle);
+
+    // Broadcast update so Webots listens
+    broadcastServo(id, angle);
+  }
+}
+
+// =====================================================
+// UDP RECEIVE (optional external control)
+// =====================================================
+void handleUDP() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+
+    int len = udp.read(packetBuffer, 50);
+    if (len > 0) packetBuffer[len] = '\0';
+
+    String msg = String(packetBuffer);
+
+    if (msg.startsWith("S")) {
+      int colon = msg.indexOf(":");
+      int id = msg.substring(1, colon).toInt();
+      int angle = msg.substring(colon + 1).toInt();
+      setServo(id, angle);
+    }
+  }
+}
+
+// =====================================================
+// WEB PAGE
+// =====================================================
+String webpage = R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<title>Robot Arm Control</title>
+<style>
+body { text-align:center; font-family:Arial; margin:20px; }
+.slider { width:300px; }
+.slider-container { margin-bottom:20px; }
+button { padding:12px 25px; margin:10px; font-size:16px; cursor:pointer; }
+.gripper-section { margin-top:40px; }
+</style>
+</head>
+<body>
+
+<h2>Robot Arm Control</h2>
+
+<div id="sliders"></div>
+
+<div class="gripper-section">
+  <h3>Gripper Control</h3>
+  <button onclick="setServo(5,90)">OPEN</button>
+  <button onclick="setServo(5,0)">CLOSE</button>
+</div>
+
+<script>
+function setServo(id,val){
+ fetch(`/set?id=${id}&angle=${val}`);
+}
+
+for(let i=0;i<5;i++){
+ document.write(`
+ <div class="slider-container">
+   <label>Servo ${i+1}</label><br>
+   <input type="range" min="0" max="180" value="90"
+   class="slider"
+   oninput="setServo(${i},this.value)">
+ </div>
+ `);
+}
+</script>
+
+</body>
+</html>
+)====";
+
+// =====================================================
+// WEB HANDLERS
+// =====================================================
+void handleRoot() {
+  server.send(200, "text/html", webpage);
+}
+
+void handleSet() {
+  int id = server.arg("id").toInt();
+  int angle = server.arg("angle").toInt();
+
+  setServo(id, angle);
+  server.send(200, "text/plain", "OK");
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  // Start Access Point
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Attach Servos
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    servos[i].attach(servoPins[i]);
+    servos[i].write(90);
+  }
+
+  udp.begin(UDP_PORT);
+
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.begin();
+
+  Serial.println("Robot Arm Ready.");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+
+  server.handleClient();
+  handleUDP();
+  updateServosSmooth();
+
+  delay(3);
+}
